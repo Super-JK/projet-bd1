@@ -35,9 +35,10 @@ class DataBaseStructure:
         get_attribut renvoie les attribut et type d'une table
     """
 
-    def __init__(self, bdd):
-        if type(bdd) == str:
-            conn = sqlite3.connect('example.db')
+    def __init__(self, db):
+        if type(db) == str:
+            self.name = db
+            conn = sqlite3.connect(db)
             c = conn.cursor()
             self.tables = {}
             for table in c.execute("SELECT name FROM sqlite_master WHERE type='table'"):
@@ -47,10 +48,10 @@ class DataBaseStructure:
                 for attr in c.execute('PRAGMA table_info(%s)' % table):
                     self.tables[table][attr[1]] = attr[2]
             conn.close()
-        elif type(bdd) == dict:
-            self.tables = bdd
+        elif type(db) == dict:
+            self.tables = db
         else:
-            raise TypeError("must be dict or Cursor not '%s' " % type(bdd))
+            raise TypeError("must be dict or Cursor not '%s' " % type(db))
 
     def has_table(self, table_name):
         return table_name in self.tables
@@ -63,6 +64,9 @@ class DataBaseStructure:
     def get_attribut(self, table_name):
         return self.tables[table_name]
 
+    def get_name(self):
+        return self.name
+
 
 def nice_print(struct):
     """
@@ -74,33 +78,87 @@ def nice_print(struct):
     return r
 
 
+def sql_attribut(attr):
+    """
+    Retourne la liste des attribut sous un format utilisable par SQL
+    """
+    r = ''
+    if isinstance(attr, dict):
+        attr = list(attr)
+
+    i = 0
+    while i < len(attr)-1:
+        r += attr[i]+', '
+        i += 1
+    r += attr[i]
+    return r
+
+
 class Request:
-    """Cette classe représente la requête qui sera traduite et/ou exécuter.
+    """Classe représentant la requête qui sera traduite et/ou exécuter.
      Elle est constitué de l'expression de cette requête ainsi que la base de donnée lié à celle ci.
 
      La cohérence de cette requête est vérifier et uen erreur est retourner en cas de problème
      """
 
-    def __init__(self, bdd, expr):
+    def __init__(self, db, expr):
 
-        type_ = type(bdd)
+        type_ = type(db)
         if type_ == DataBaseException:
-            self.bdd = bdd
+            self.db = db
         elif type_ == str or type_ == dict:
-            self.bdd = DataBaseStructure(bdd)
+            self.db = DataBaseStructure(db)
         else:
-            raise TypeError("must be DataBaseStructure not '%s'" % type(bdd))
+            raise TypeError("must be DataBaseStructure not '%s'" % type(db))
 
         if isinstance(expr, Expression):
             self.expr = expr
-            self.expr.check(self.bdd)
-        elif isinstance(expr, str):
-            self.expr = expr
+            self.expr.check(self.db)
         else:
             raise TypeError("must be Expression not '%s'" % type(expr))
 
     def __str__(self):
         return str(self.expr)
+
+    def translate(self):
+        return self.expr.translate()
+
+    def execute(self):
+        name = self.db.get_name()
+        if name is None:
+            raise DataBaseException("no sqlite database provided")
+        conn = sqlite3.connect(name)
+        c = conn.cursor()
+        result = c.execute(self.translate()).fetchall()
+        c.close()
+        return result
+
+    def create_new_table(self, table_name):
+        name = self.db.get_name()
+        if name is None:
+            raise DataBaseException("no sqlite database provided")
+        conn = sqlite3.connect(name)
+        c = conn.cursor()
+        result = c.execute("CREATE TABLE %s AS %s" % (table_name, self.translate()))
+        c.close()
+        return result
+
+    def print_result(self):
+        tab = self.execute()
+        attr = self.expr.get_attr()
+        res = ""
+
+        for elem in attr:
+            res += "{0:<11.11}| ".format(elem)
+
+        res += '\n{:-<{}s}\n'.format('', len(res))
+
+        for elem in tab:
+            for subelem in elem:
+                res += "{0:<13}".format(subelem)
+            res += '\n'
+
+        print(res)
 
 
 class Expression:
@@ -108,6 +166,7 @@ class Expression:
 
     def __init__(self, *arg):
         self.arg = arg
+        self.db = None
 
     def __str__(self):
         r = ""
@@ -115,7 +174,11 @@ class Expression:
             r += str(test) + " "
         return r
 
-    def check(self, bdd):
+    def check(self, db):
+        self.db = db
+        pass
+
+    def translate(self):
         pass
 
 
@@ -127,20 +190,25 @@ class Relation(Expression):
     """
 
     def __init__(self, args):
-        self.attr = []
+        super().__init__(args)
+        self.attr = {}
         self.arg = args
 
     def __str__(self):
         return str(self.arg)
 
-    def check(self, bdd):
-        if not bdd.has_table(self.arg):
+    def check(self, db):
+        self.db = db
+        if not db.has_table(self.arg):
             raise DataBaseException("Table '%s' not in the database" % self.arg)
 
-    def get_attr(self, bdd):
+    def get_attr(self):
         if len(self.attr) == 0:
-            self.attr = bdd.get_attribut(self.arg)
+            self.attr = self.db.get_attribut(self.arg)
         return self.attr
+
+    def translate(self):
+        return str(self.arg)
 
 
 class Projection(Expression):
@@ -155,6 +223,9 @@ class Projection(Expression):
         self.attr = attr
         self.expr = expr
 
+        if not isinstance(attr, list):
+            self.attr = [attr]
+
         if isinstance(self.expr, str):
             self.expr = Relation(self.expr)
         elif not isinstance(self.expr, Expression):
@@ -163,20 +234,24 @@ class Projection(Expression):
     def __str__(self):
         return "proj( " + str(self.attr) + ", " + str(self.expr) + " )"
 
-    def check(self, bdd):
-        self.expr.check(bdd)
-        expr_attr = self.expr.get_attr(bdd)
+    def check(self, db):
+        self.db = db
+        self.expr.check(db)
+        expr_attr = self.expr.get_attr()
         for attr in self.attr:
             if attr not in expr_attr:
                 raise InvalidExpression("The expression \n%s\n "
                                         "is invalid because attribut '%s' is not in the schema %s" %
                                         (self.__str__(), str(attr), nice_print(expr_attr)))
 
-    def get_attr(self, bdd):
+    def translate(self):
+        return "SELECT DISTINCT " + sql_attribut(self.attr) + " FROM (" + self.expr.translate() + ")"
+
+    def get_attr(self):
         attrs = {}
-        expr_attr = self.expr.get_attr(bdd)
-        for attr in expr_attr:
-            if attr in self.attr:
+        expr_attr = self.expr.get_attr()
+        for attr in self.attr:
+            if attr in expr_attr:
                 attrs[attr] = expr_attr[attr]
         return attrs
 
@@ -198,34 +273,32 @@ class Selection(Expression):
         elif not isinstance(self.expr, Expression):
             raise TypeError("must be Expression not '%s'" % type(expr))
 
-        if not isinstance(self.cond, Equal):
+        if not isinstance(self.cond, Condition):
             raise TypeError("must be Equal not '%s'" % type(expr))
 
     def __str__(self):
         return "select(" + str(self.cond) + ", " + str(self.expr) + ")"
 
-    def check(self, bdd):
-        self.expr.check(bdd)
+    def check(self, db):
+        self.db = db
+        self.expr.check(db)
 
-        self.cond.check(bdd, self.expr.get_attr(bdd))
+        self.cond.check(self.expr.get_attr())
 
-    def get_attr(self, bdd):
-        return self.expr.get_attr(bdd)
+    def get_attr(self):
+        return self.expr.get_attr()
+
+    def translate(self):
+        return "SELECT * FROM ("+self.expr.translate()+") WHERE "+self.cond.translate()
 
 
-class Equal(Expression):
-    """Représente une égalité entre attribut ou avec une constante utilisé pour la sélection.
-    """
-
+class Condition(Expression):
     def __init__(self, left, right):
         super().__init__(left, right)
         self.left = left
         self.right = right
 
-    def __str__(self):
-        return "equ(" + str(self.left) + " = " + str(self.right) + ")"
-
-    def check(self, bdd, attr):
+    def check(self, attr):
         if self.left not in attr:
             raise InvalidExpression("The expression \n%s\n "
                                     "is invalid because attribut '%s' is not in the schema %s" %
@@ -238,17 +311,87 @@ class Equal(Expression):
             elif attr[self.left] != attr[self.right]:
                 raise AttributError("The expression \n%s\n"
                                     "is invalid because type of attribut\n'%s' %s\nis not in the same as\n'%s' %s" %
-                                    (self.__str__(), str(self.left), attr[self.left], str(self.right), attr[self.right]))
+                                    (self.__str__(), str(self.left), attr[self.left],
+                                     str(self.right), attr[self.right]))
+
+
+class Equal(Condition):
+    """Représente une égalité entre attribut ou avec une constante utilisé pour la sélection.
+    """
+
+    def __str__(self):
+        return "equ(" + str(self.left) + " = " + str(self.right) + ")"
+
+    def translate(self):
+        return str(self.left)+' = '+str(self.right)
+
+
+class Neq(Condition):
+    """Représente une negation d'égalité entre attribut ou avec une constante utilisé pour la sélection.
+    """
+
+    def __str__(self):
+        return "neq(" + str(self.left) + " != " + str(self.right) + ")"
+
+    def translate(self):
+        return str(self.left)+' != '+str(self.right)
+
+
+class Gtr(Condition):
+    """Représente une comparaison plus grand entre attribut ou avec une constante utilisé pour la sélection.
+    """
+
+    def __str__(self):
+        return "gtr(" + str(self.left) + " > " + str(self.right) + ")"
+
+    def translate(self):
+        return str(self.left)+' > '+str(self.right)
+
+
+class Geq(Condition):
+    """Représente une comparaison plus grand ou égal entre attribut ou avec une constante utilisé pour la sélection.
+    """
+
+    def __str__(self):
+        return "geq(" + str(self.left) + " >= " + str(self.right) + ")"
+
+    def translate(self):
+        return str(self.left)+' >= '+str(self.right)
+
+
+class Lss(Condition):
+    """Représente une comparaison plus petit entre attribut ou avec une constante utilisé pour la sélection.
+    """
+
+    def __str__(self):
+        return "lss(" + str(self.left) + " < " + str(self.right) + ")"
+
+    def translate(self):
+        return str(self.left)+' < '+str(self.right)
+
+
+class Leq(Condition):
+    """Représente une comparaison plus petit ou égal entre attribut ou avec une constante utilisé pour la sélection.
+    """
+
+    def __str__(self):
+        return "leq(" + str(self.left) + " <= " + str(self.right) + ")"
+
+    def translate(self):
+        return str(self.left)+' <= '+str(self.right)
 
 
 class Const:
-    """Représente une constante utilisé dans l'expression Equal"""
+    """Représente une constante utilisé dans les expressions Condition"""
 
-    def __init__(self, *arg):
+    def __init__(self, arg):
         self.arg = arg
 
     def __str__(self):
-        return str(self.arg)
+        if type(self.arg) == str:
+            return "'%s'" % self.arg
+        else:
+            return str(self.arg)
 
 
 class Join(Expression):
@@ -276,19 +419,23 @@ class Join(Expression):
     def __str__(self):
         return "join( " + str(self.left) + " and " + str(self.right) + " )"
 
-    def check(self, bdd):
-        self.right.check(bdd)
-        self.left.check(bdd)
+    def check(self, db):
+        self.db = db
+        self.right.check(db)
+        self.left.check(db)
 
-    def get_attr(self, bdd):
-        left_attr = self.left.get_attr(bdd)
-        right_attr = self.right.get_attr(bdd)
+    def get_attr(self):
+        left_attr = self.left.get_attr()
+        right_attr = self.right.get_attr()
 
         for attr in left_attr:
             if attr not in right_attr:
                 right_attr[attr] = left_attr[attr]
 
         return right_attr
+
+    def translate(self):
+        return "SELECT * FROM ("+self.left.translate()+") NATURAL JOIN ("+self.right.translate()+")"
 
 
 class Rename(Expression):
@@ -312,28 +459,42 @@ class Rename(Expression):
     def __str__(self):
         return "rename( [" + str(self.old) + " to " + str(self.new) + "], " + str(self.expr) + " )"
 
-    def check(self, bdd):
-        self.expr.check(bdd)
-        attr = self.expr.get_attr(bdd)
+    def check(self, db):
+        self.db = db
+        self.expr.check(db)
+        attr = self.expr.get_attr()
         if self.old not in attr:
             raise InvalidExpression("The expression \n%s\n"
                                     "is invalid because attribut\n'%s'\nis not in the schema\n%s" %
                                     (self.__str__(), str(self.old), nice_print(attr)))
 
-    def get_attr(self, bdd):
-        attr = self.expr.get_attr(bdd)
-        i = attr.index(self.old)
-        attr[i] = self.new
-        return attr
+    def get_attr(self):
+        attr = self.expr.get_attr()
+        res = {}
+        for elem in attr:
+            if elem == self.old:
+                res[self.new] = attr[elem]
+            else:
+                res[elem] = attr[elem]
+        return res
+
+    def translate(self):
+        attr = self.expr.get_attr()
+
+        r = ""
+        for i in attr:
+            if i == self.old:
+                r += self.old+" as "+self.new+", "
+            else:
+                r += i+", "
+        r = r[0:len(r)-2]
+        return "SELECT "+r+" FROM ("+self.expr.translate() + ")"
 
 
-class Union(Expression):
-    """Classe représentant une union
-
-   check vérifie la cohérence des attributs
-   get_attr retourne les attributs de l'expression
-   """
-
+class DualExpr(Expression):
+    """
+    Représente   une expression double générique. Classe mère de Union et Difference
+    """
     def __init__(self, left, right):
         super().__init__(left, right)
         self.left = left
@@ -349,14 +510,15 @@ class Union(Expression):
         elif not isinstance(self.right, Expression):
             raise TypeError("must be Expression not '%s'" % type(right))
 
-    def __str__(self):
-        return "union( " + str(self.left) + " and " + str(self.right) + " )"
+    def get_attr(self):
+        return self.left.get_attr()
 
-    def check(self, bdd):
-        self.left.check(bdd)
-        self.right.check(bdd)
-        left_attr = self.left.get_attr(bdd)
-        right_attr = self.right.get_attr(bdd)
+    def check(self, db):
+        self.db = db
+        self.left.check(db)
+        self.right.check(db)
+        left_attr = self.left.get_attr()
+        right_attr = self.right.get_attr()
         if left_attr != right_attr:
             raise InvalidExpression("The expression \n%s\n"
                                     "is invalid because attributs of \n%s\n"
@@ -365,48 +527,39 @@ class Union(Expression):
                                     (self.__str__(), str(self.left), nice_print(left_attr),
                                      str(self.right), nice_print(right_attr)))
 
-    def get_attr(self, bdd):
-        return self.left.get_attr(bdd)
+    def translate(self):
+        left = self.left.translate()
+        right = self.right.translate()
+
+        if isinstance(self.left, Relation):
+            left = "SELECT * FROM "+str(self.left)
+        if isinstance(self.right, Relation):
+            right = "SELECT * FROM "+str(self.right)
+
+        return left, right
 
 
-class Difference(Expression):
+class Union(DualExpr):
+    """Classe représentant une union
+    Hérite de DualExpr (similaire à Difference)
+   """
+
+    def __str__(self):
+        return "union( " + str(self.left) + " and " + str(self.right) + " )"
+
+    def translate(self):
+        r = super().translate()
+        return "%s UNION %s" % r
+
+
+class Difference(DualExpr):
     """Classe représentant une différence
-
-    check vérifie la cohérence des attributs
-    get_attr retourne les attributs de l'expression
+    Hérite de DualExpr (similaire à Union)
     """
-
-    def __init__(self, left, right):
-        super().__init__(left, right)
-        self.left = left
-        self.right = right
-
-        if isinstance(self.left, str):
-            self.left = Relation(self.left)
-        elif not isinstance(self.left, Expression):
-            raise Exception('pas une expression')
-
-        if isinstance(self.right, str):
-            self.right = Relation(self.right)
-        elif not isinstance(self.right, Expression):
-            raise Exception('pas une expression')
 
     def __str__(self):
         return "diff( " + str(self.left) + " - " + str(self.right) + " )"
 
-    def check(self, bdd):
-        self.left.check(bdd)
-        self.right.check(bdd)
-
-        left_attr = self.left.get_attr(bdd)
-        right_attr = self.right.get_attr(bdd)
-        if left_attr != right_attr:
-            raise InvalidExpression("The expression \n%s\n"
-                                    "is invalid because attributs of \n%s\n"
-                                    "which are \n%s\n"
-                                    "does not match those from \n%s\nwhich are%s" %
-                                    (self.__str__(), str(self.left), nice_print(left_attr),
-                                     str(self.right), nice_print(right_attr)))
-
-    def get_attr(self, bdd):
-        return self.left.get_attr(bdd)
+    def translate(self):
+        r = super().translate()
+        return "%s EXCEPT %s" % r

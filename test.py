@@ -3,16 +3,17 @@ from engine import *
 
 def main():
 
-    proj = Projection(['date', 'trans'], 'stocks')
-    select = Selection(Equal('date', 'trans'), proj)
-    join = Join('stocks', select)
-    rename = Rename('trans', 'transaction', join)
+    select = Selection(Leq('sal', Const(1000)), 'emp')
+    proj = Projection(['ename', 'empno', 'sal', 'job'], select)
+    join = Join('stocks', proj)
+    rename = Rename('sal', 'lol', proj)
     union = Union(join, 'stocks')
     diff = Difference(union, 'stocks')
 
-    expr = diff
-    req = Request('example.db', expr)
-    print(req)
+    expr = rename
+    req = Request('TestTAbles.db', expr)
+    print(req.translate())
+    req.print_result()
 
 
 if __name__ == '__main__':
